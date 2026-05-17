@@ -1,4 +1,4 @@
-# AggregatorX - Advanced Multi-Provider Search Aggregator
+this app fucking sucks dont try it you'll be highly disappointed..# AggregatorX - Advanced Multi-Provider Search Aggregator
 
 [![Android Build](https://github.com/zimbiss/aggrevation-x/actions/workflows/android.yml/badge.svg)](https://github.com/zimbiss/aggrevation-x/actions/workflows/android.yml)
 
