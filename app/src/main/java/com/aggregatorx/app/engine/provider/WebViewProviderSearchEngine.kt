@@ -7,6 +7,8 @@ import com.aggregatorx.app.data.model.Provider
 import com.aggregatorx.app.data.model.SearchResult
 import com.aggregatorx.app.engine.webview.JavaScriptWebViewEngine
 import org.jsoup.Jsoup
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
 
 /**
  * WebView-based Provider Search Engine for JavaScript-heavy sites.
@@ -126,10 +128,12 @@ class WebViewProviderSearchEngine(private val context: Context) {
             val links = engine.extractAllLinks("a[href*='${provider.searchPattern.takeWhile { it != '?' }}']")
             Log.d(TAG, "Extracted ${links.size} links from ${provider.name} after scrolling")
 
-            // Get final HTML safely via typed callback
-            var finalHtml = ""
-            webView.evaluateJavascript("document.documentElement.outerHTML") { result: String? ->
-                finalHtml = result?.trim('"')?.replace("\\\"", "\"") ?: ""
+            // FIX: Wait asynchronously for the HTML layout extraction to fully finish
+            val finalHtml = suspendCancellableCoroutine<String> { continuation ->
+                webView.evaluateJavascript("document.documentElement.outerHTML") { result: String? ->
+                    val html = result?.trim('"')?.replace("\\\"", "\"") ?: ""
+                    continuation.resume(html)
+                }
             }
             
             finalHtml
@@ -146,7 +150,6 @@ class WebViewProviderSearchEngine(private val context: Context) {
      * Build search URL for the provider.
      */
     private fun buildSearchUrl(provider: Provider, query: String): String {
-        // Provider should have searchPattern like "https://example.com/search?q={query}"
         return provider.searchPattern
             .replace("{query}", query)
             .replace("{QUERY}", query)
@@ -157,7 +160,6 @@ class WebViewProviderSearchEngine(private val context: Context) {
 
     /**
      * Parse rendered HTML to extract search results.
-     * Can be combined with existing result parsing logic.
      */
     fun parseWebViewResults(
         html: String,
@@ -165,21 +167,45 @@ class WebViewProviderSearchEngine(private val context: Context) {
     ): List<SearchResult> {
         return try {
             val doc = Jsoup.parse(html, provider.baseUrl)
-
-            // Use provider's result patterns to extract results
             val results = mutableListOf<SearchResult>()
 
-            // Fixed here: Removed the broken provider.analysis lookup chain 
-            // and safely defaulted to the standard ".result" selector layout
-            val resultElements = doc.select(".result")
+            // FIX: Instead of relying on just ".result", look for standard table rows or lists first
+            var resultElements = doc.select("tr:has(a), .result-item, .search-result, .torrent-box, .play-row, [class*='item']:has(a)")
+
+            // Fallback: If rows aren't found, check if we accidentally selected a single giant parent wrapper box
+            if (resultElements.isEmpty()) {
+                val wrappers = doc.select(".result, .results, #results, .search-results")
+                if (wrappers.size == 1) {
+                    // Dive inside the wrapper and grab all individual rows/links instead of treating it as 1 item
+                    resultElements = wrappers.first()?.select("tr, div[class*='item'], div[class*='row'], li, a") ?: doc.select("a")
+                } else if (wrappers.size > 1) {
+                    resultElements = wrappers
+                }
+            }
+
+            // Ultimate fallback: Just scan every raw link on the page if nothing else matched
+            if (resultElements.isEmpty()) {
+                resultElements = doc.select("a")
+            }
 
             resultElements.forEach { element ->
                 try {
-                    val title = element.selectFirst("a")?.text() ?: "Unknown"
-                    val url = element.selectFirst("a")?.attr("href") ?: ""
-                    val quality = element.selectFirst("[class*='quality']")?.text() ?: "auto"
+                    val anchor = if (element.tagName() == "a") element else element.selectFirst("a")
 
-                    if (url.isNotEmpty() && title.isNotEmpty()) {
+                    val title = anchor?.text() ?: ""
+                    var url = anchor?.attr("href") ?: ""
+                    val quality = element.selectFirst("[class*='quality'], [class*='resolution']")?.text() ?: "auto"
+
+                    // Clean relative paths (e.g. "/download/123" -> "https://site.com/download/123")
+                    if (url.startsWith("/")) {
+                        url = provider.baseUrl.trimEnd('/') + url
+                    }
+
+                    // Strict filter to drop non-result site menus (Login, FAQ, Home, etc.)
+                    val junkWords = listOf("home", "login", "register", "sign up", "faq", "about", "contact", "privacy", "terms", "logout", "index")
+                    val isJunk = junkWords.any { title.equals(it, ignoreCase = true) } || url.contains(".css") || url.contains(".js") || url.startsWith("#")
+
+                    if (url.isNotEmpty() && title.isNotEmpty() && !isJunk && title.length > 3) {
                         results.add(
                             SearchResult(
                                 title = title,
