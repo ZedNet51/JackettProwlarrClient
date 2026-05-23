@@ -56,7 +56,7 @@ fun SearchScreen(
     val providerResults      by viewModel.providerResults.collectAsState()
     val likedUrls            by viewModel.likedUrls.collectAsState()
     val isPaused             by viewModel.isDiscoveryPaused.collectAsState()
-    val providerPages        by viewModel.providerPages.collectAsState()
+    val isLoop2Running       by viewModel.isLoop2Running.collectAsState()
     val tokenResults         by viewModel.tokenResults.collectAsState()
     val myAiResults          by viewModel.myAiResults.collectAsState()
     val videoExtractionState by viewModel.videoExtractionState.collectAsState()
@@ -141,7 +141,7 @@ fun SearchScreen(
                         tokenResults             = tokenResults,
                         listState                = listState,
                         likedUrls                = likedUrls,
-                        providerPages            = providerPages,
+                        isLoop2Running           = isLoop2Running,
                         onWatch                  = { result -> viewModel.extractVideoUrl(result) },
                         onDownload               = { result ->
                             viewModel.downloadResult(result)
@@ -151,7 +151,6 @@ fun SearchScreen(
                             context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(result.url)))
                         },
                         onInApp                  = { result ->
-                            // If extraction already succeeded for this result, launch immediately.
                             val currentState = viewModel.videoExtractionState.value
                             if (currentState is VideoExtractionState.Success &&
                                 currentState.title == result.title
@@ -166,16 +165,12 @@ fun SearchScreen(
                                 )
                                 viewModel.resetVideoState()
                             } else {
-                                // Kick off extraction; the LaunchedEffect below will
-                                // auto-launch VideoPlayerActivity once it completes.
                                 pendingInAppLaunch = true
                                 viewModel.extractVideoUrl(result)
                                 Toast.makeText(context, "Loading: ${result.title}…", Toast.LENGTH_SHORT).show()
                             }
                         },
                         onLike                   = { result -> viewModel.toggleLike(result) },
-                        onNextPage               = { id -> viewModel.nextProviderPage(id) },
-                        onPrevPage               = { id -> viewModel.prevProviderPage(id) },
                         onRefreshProvider        = { id -> viewModel.refreshProvider(id) },
                         onExtractVideoForPreview = { url -> viewModel.extractVideoForPreview(url) },
                         modifier                 = Modifier.weight(1f)
@@ -362,7 +357,8 @@ fun SearchScreen(
                     totalResults        = uiState.totalResults,
                     successfulProviders = uiState.successfulProviders,
                     failedProviders     = uiState.failedProviders,
-                    isSearching         = uiState.isSearching
+                    isSearching         = uiState.isSearching,
+                    isLoop2Running      = isLoop2Running
                 )
             }
         }
@@ -375,27 +371,48 @@ fun SearchStatsBar(
     totalResults: Int,
     successfulProviders: Int,
     failedProviders: Int,
-    isSearching: Boolean
+    isSearching: Boolean,
+    isLoop2Running: Boolean = false
 ) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 12.dp, vertical = 4.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(DarkCard)
-            .padding(horizontal = 16.dp, vertical = 8.dp),
-        horizontalArrangement = Arrangement.SpaceEvenly,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        StatItem(Icons.Default.Summarize, totalResults.toString(), "RESULTS", NeonGreen)
-        StatItem(Icons.Default.CheckCircle, successfulProviders.toString(), "OK", AccentGreen)
-        StatItem(Icons.Default.Error, failedProviders.toString(), "FAIL",
-            if (failedProviders > 0) AccentRed else TextTertiary)
-        if (isSearching) {
-            CircularProgressIndicator(
-                modifier = Modifier.size(20.dp),
-                color = NeonGreen,
-                strokeWidth = 2.dp
+    Column {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 4.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(DarkCard)
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            StatItem(Icons.Default.Summarize, totalResults.toString(), "RESULTS", NeonGreen)
+            StatItem(Icons.Default.CheckCircle, successfulProviders.toString(), "OK", AccentGreen)
+            StatItem(Icons.Default.Error, failedProviders.toString(), "FAIL",
+                if (failedProviders > 0) AccentRed else TextTertiary)
+            // Loop 1 spinner
+            if (isSearching) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(20.dp),
+                    color = NeonGreen, strokeWidth = 2.dp
+                )
+            }
+            // Loop 2 spinner (cyan = smart/preference pass)
+            if (isLoop2Running && !isSearching) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(20.dp),
+                    color = CyberCyan, strokeWidth = 2.dp
+                )
+            }
+        }
+        // Loop-2 label strip
+        AnimatedVisibility(visible = isLoop2Running && !isSearching) {
+            Text(
+                "Finding related & preference results…",
+                color = CyberCyan, fontSize = 9.sp,
+                letterSpacing = 0.5.sp,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 2.dp)
             )
         }
     }
@@ -567,19 +584,16 @@ fun ResultsFeed(
     tokenResults: List<SearchResult>,
     listState: LazyListState,
     likedUrls: Set<String>,
-    providerPages: Map<String, Int>,
+    isLoop2Running: Boolean = false,
     onWatch: (SearchResult) -> Unit,
     onDownload: (SearchResult) -> Unit,
     onBrowser: (SearchResult) -> Unit,
     onInApp: (SearchResult) -> Unit,
     onLike: (SearchResult) -> Unit,
-    onNextPage: (String) -> Unit,
-    onPrevPage: (String) -> Unit,
     onRefreshProvider: (String) -> Unit,
     onExtractVideoForPreview: (suspend (String) -> VideoPreviewResult?)? = null,
     modifier: Modifier = Modifier
 ) {
-    val PAGE_SIZE = 20
     val successProviders = providerResults.filter { it.success && it.results.isNotEmpty() }
     val failedProviders  = providerResults.filter { !it.success }
 
@@ -684,26 +698,45 @@ fun ResultsFeed(
             }
         }
 
-        // Provider sections with pagination
+        // Loop-2 "finding more" banner — visible while smart/preference loop runs
+        if (isLoop2Running) {
+            item(key = "loop2_banner") {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 12.dp, vertical = 4.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(CyberCyan.copy(alpha = 0.08f))
+                        .padding(horizontal = 14.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(14.dp),
+                        color = CyberCyan, strokeWidth = 2.dp
+                    )
+                    Text(
+                        "Finding related & preference results…",
+                        color = CyberCyan, fontSize = 10.sp,
+                        fontWeight = FontWeight.Medium, letterSpacing = 0.5.sp
+                    )
+                }
+            }
+        }
+
+        // Provider sections — all results shown, no pagination
         displayProviders.forEach { pr ->
-            val providerId  = pr.provider.id.toString()
-            val currentPage = providerPages[providerId] ?: 0
-            val pageResults = pr.results.drop(currentPage * PAGE_SIZE).take(PAGE_SIZE)
-            val totalPages  = (pr.results.size + PAGE_SIZE - 1) / PAGE_SIZE
+            val providerId = pr.provider.id.toString()
 
             item(key = "hdr_$providerId") {
                 ProviderSectionHeader(
-                    name         = pr.provider.name,
-                    resultCount  = pr.results.size,
-                    currentPage  = currentPage,
-                    totalPages   = totalPages,
-                    onPrev       = { onPrevPage(providerId) },
-                    onNext       = { onNextPage(providerId) },
-                    onRefresh    = { onRefreshProvider(providerId) }
+                    name        = pr.provider.name,
+                    resultCount = pr.results.size,
+                    onRefresh   = { onRefreshProvider(providerId) }
                 )
             }
 
-            items(pageResults, key = { "${providerId}_${it.url.hashCode()}" }) { result ->
+            items(pr.results, key = { "${providerId}_${it.url.hashCode()}" }) { result ->
                 ShieldedResultCard(
                     result = result, isLiked = result.url in likedUrls,
                     onWatch = { onWatch(result) }, onDownload = { onDownload(result) },
@@ -742,15 +775,11 @@ fun ResultsFeed(
     }
 }
 
-// ── PROVIDER SECTION HEADER with pagination ───────────────────────────────────
+// ── PROVIDER SECTION HEADER ───────────────────────────────────────────────────
 @Composable
 fun ProviderSectionHeader(
     name: String,
     resultCount: Int,
-    currentPage: Int,
-    totalPages: Int,
-    onPrev: () -> Unit,
-    onNext: () -> Unit,
     onRefresh: () -> Unit
 ) {
     Row(
@@ -762,47 +791,20 @@ fun ProviderSectionHeader(
             .padding(horizontal = 12.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        // Provider name + count
         Column(modifier = Modifier.weight(1f)) {
-            Text(name.uppercase(), color = NeonGreen, fontSize = 11.sp,
+            Text(
+                name.uppercase(), color = NeonGreen, fontSize = 11.sp,
                 fontWeight = FontWeight.Bold, letterSpacing = 1.sp,
-                maxLines = 1, overflow = TextOverflow.Ellipsis)
+                maxLines = 1, overflow = TextOverflow.Ellipsis
+            )
             Text("$resultCount results", color = TextTertiary, fontSize = 9.sp)
         }
-
-        // Pagination controls — top-right of section header
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            // Refresh
-            IconButton(onClick = onRefresh, modifier = Modifier.size(28.dp)) {
-                Icon(Icons.Default.Refresh, "Refresh", tint = NeonGreen.copy(alpha = 0.7f),
-                    modifier = Modifier.size(14.dp))
-            }
-            // Prev
-            IconButton(
-                onClick = onPrev,
-                enabled = currentPage > 0,
-                modifier = Modifier.size(28.dp)
-            ) {
-                Icon(Icons.Default.ChevronLeft, "<",
-                    tint = if (currentPage > 0) NeonGreen else TextMuted,
-                    modifier = Modifier.size(16.dp))
-            }
-            // Page indicator
-            Text(
-                "${currentPage + 1}/$totalPages",
-                color = TextSecondary, fontSize = 10.sp,
-                modifier = Modifier.padding(horizontal = 2.dp)
+        IconButton(onClick = onRefresh, modifier = Modifier.size(28.dp)) {
+            Icon(
+                Icons.Default.Refresh, "Refresh",
+                tint = NeonGreen.copy(alpha = 0.7f),
+                modifier = Modifier.size(14.dp)
             )
-            // Next
-            IconButton(
-                onClick = onNext,
-                enabled = currentPage < totalPages - 1,
-                modifier = Modifier.size(28.dp)
-            ) {
-                Icon(Icons.Default.ChevronRight, ">",
-                    tint = if (currentPage < totalPages - 1) NeonGreen else TextMuted,
-                    modifier = Modifier.size(16.dp))
-            }
         }
     }
 }
@@ -1190,14 +1192,12 @@ fun ProviderResultsList(
         tokenResults             = emptyList(),
         listState                = listState,
         likedUrls                = likedUrls,
-        providerPages            = emptyMap(),
+        isLoop2Running           = false,
         onWatch                  = { onResultClick(it) },
         onDownload               = { onDownload(it) },
         onBrowser                = { onOpenExternal(it) },
         onInApp                  = { onResultClick(it) },
         onLike                   = { onLike(it) },
-        onNextPage               = {},
-        onPrevPage               = {},
         onRefreshProvider        = {},
         onExtractVideoForPreview = onExtractVideoForPreview,
         modifier                 = modifier
