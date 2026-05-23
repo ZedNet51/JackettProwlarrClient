@@ -1,126 +1,99 @@
 package com.aggregatorx.app.engine.webview
 
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
-import android.webkit.WebView
-import android.webkit.WebViewClient
-import java.util.concurrent.CompletableFuture
+import android.annotation.SuppressLint
+import android.os.Handler
+import android.os.Looper
+import android.webkit.*
+import com.aggregatorx.app.engine.util.AppContextHolder
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.json.Json
 import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 /**
- * Cleaned WebView Engine - Zero Cache, Pure Live Streaming Pipes.
+ * Android WebView engine for JS-heavy / SPA sites.
+ *
+ * Replaces any Playwright dependency — runs entirely on the device using the
+ * system WebView (Chromium-based on all modern Android including Snapdragon S24).
+ *
+ * All public methods are suspend functions safe to call from IO coroutines;
+ * they internally dispatch WebView operations to the Main thread.
  */
-class JavaScriptWebViewEngine(private val webView: WebView) {
+@SuppressLint("SetJavaScriptEnabled")
+class JavaScriptWebViewEngine(private val existingWebView: WebView? = null) {
 
-    private var pageContent = ""
-    private var readySignal = CompletableFuture<String>()
+    private val mainHandler = Handler(Looper.getMainLooper())
 
-    init {
-        configureWebView()
-    }
+    // ── Core load ─────────────────────────────────────────────────────────────
 
-    private fun configureWebView() {
-        webView.apply {
-            // Completely wipe past storage arrays out of memory
-            clearCache(true)
-            clearHistory()
-            clearFormData()
-
-            settings.apply {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                databaseEnabled = true
-                
-                // CRITICAL FIX 1: Bypass local storage and force live network fetches every time
-                cacheMode = android.webkit.WebSettings.LOAD_NO_CACHE
-                mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
-                javaScriptCanOpenWindowsAutomatically = false
-                
-                // CRITICAL FIX 2: Mask as a standard modern desktop browser to bypass bot gates
-                userAgentString = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            }
-
-            // Flush out background cookies to prevent sticky tracking behavior
-            val cookieManager = android.webkit.CookieManager.getInstance()
-            cookieManager.setAcceptCookie(true)
-            cookieManager.setAcceptThirdPartyCookies(this, true)
-            cookieManager.removeAllCookies(null)
-            cookieManager.flush()
-        }
-    }
-
-    private fun extractPageContent(view: WebView) {
-        view.evaluateJavascript(
-            """
-            (function() {
-                return document.documentElement.outerHTML;
-            })();
-            """.trimIndent()
-        ) { result ->
-            val html = result?.trim('"')?.replace("\\\"", "\"") ?: ""
-            onJSContentReady(html)
-        }
-    }
-
+    /**
+     * Load [url], wait for JS to settle, return full rendered HTML.
+     * Optionally injects [query] into the first search input found.
+     */
     suspend fun loadUrlWithJavaScript(
         url: String,
         query: String? = null,
-        timeoutMs: Long = 12000
-    ): String {
-        return suspendCancellableCoroutine { continuation ->
-            var isResumed = false
+        timeoutMs: Long = 15_000L
+    ): String = withTimeoutOrNull(timeoutMs) {
+        suspendCancellableCoroutine { cont ->
+            mainHandler.post {
+                val ctx = AppContextHolder.get()
+                    ?: existingWebView?.context
+                    ?: run { if (cont.isActive) cont.resume(""); return@post }
 
-            fun safeResume(html: String) {
-                if (!isResumed) {
-                    isResumed = true
-                    continuation.resume(html)
+                val wv = existingWebView ?: WebView(ctx)
+                var resumed = false
+
+                fun done(html: String) {
+                    if (!resumed) {
+                        resumed = true
+                        if (existingWebView == null) { wv.stopLoading(); wv.destroy() }
+                        if (cont.isActive) cont.resume(html)
+                    }
                 }
-            }
 
-            val timeoutRunnable = Runnable {
-                webView.evaluateJavascript("document.documentElement.outerHTML") { result ->
-                    val html = result?.trim('"')?.replace("\\\"", "\"") ?: ""
-                    safeResume(html)
+                cont.invokeOnCancellation { done("") }
+                configureWebView(wv)
+
+                wv.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView, loadedUrl: String) {
+                        view.postDelayed({
+                            if (query != null) {
+                                injectSearchAndCapture(view, query, 4_000) { done(it) }
+                            } else {
+                                captureHtml(view) { done(it) }
+                            }
+                        }, 2_500)
+                    }
+                    override fun onReceivedError(
+                        view: WebView, req: WebResourceRequest, err: WebResourceError
+                    ) { if (req.isForMainFrame) captureHtml(view) { done(it) } }
                 }
+                wv.loadUrl(url)
             }
-            webView.postDelayed(timeoutRunnable, timeoutMs)
-
-            webView.webViewClient = object : WebViewClient() {
-                override fun onPageFinished(view: WebView, loadedUrl: String) {
-                    // Let async content settle cleanly for 3 seconds post-initialization
-                    view.postDelayed({
-                        view.evaluateJavascript("document.documentElement.outerHTML") { result ->
-                            val html = result?.trim('"')?.replace("\\\"", "\"") ?: ""
-                            webView.removeCallbacks(timeoutRunnable)
-                            safeResume(html)
-                        }
-                    }, 3000)
-                }
-            }
-
-            webView.loadUrl(url)
         }
-    }
+    } ?: ""
 
+    // ── Search injection ──────────────────────────────────────────────────────
+
+    /**
+     * Inject [query] into the search field identified by [searchSelector],
+     * click [submitSelector], wait for [resultSelector] to appear, return HTML.
+     */
     suspend fun injectSearchAndWait(
         searchSelector: String,
         submitSelector: String,
         query: String,
         resultSelector: String,
-        timeoutMs: Long = 15000
-    ): String {
-        return suspendCancellableCoroutine { continuation ->
-            var isResumed = false
-
-            fun safeResume(html: String) {
-                if (!isResumed) {
-                    isResumed = true
-                    continuation.resume(html)
+        timeoutMs: Long = 18_000L
+    ): String = withTimeoutOrNull(timeoutMs) {
+        suspendCancellableCoroutine { cont ->
+            mainHandler.post {
+                val wv = existingWebView ?: return@post
+                var resumed = false
+                fun done(html: String) {
+                    if (!resumed) { resumed = true; if (cont.isActive) cont.resume(html) }
                 }
-            }
+                cont.invokeOnCancellation { done("") }
 
             val js = """
             (function() {
@@ -152,15 +125,12 @@ class JavaScriptWebViewEngine(private val webView: WebView) {
                             val html = finalHtml?.trim('"')?.replace("\\\"", "\"") ?: ""
                             safeResume(html)
                         }
-                    } else {
-                        checkRunnable?.let { webView.postDelayed(it, 500) }
                     }
                 }
+                wv.postDelayed(check, 1_500)
             }
-
-            webView.postDelayed(checkRunnable, 1500)
         }
-    }
+    } ?: ""
 
     suspend fun extractAllLinks(selector: String = "a[href]"): List<String> {
         return suspendCancellableCoroutine { continuation ->
@@ -185,35 +155,118 @@ class JavaScriptWebViewEngine(private val webView: WebView) {
         }
     }
 
-    suspend fun scrollToBottom(scrollCount: Int = 3) {
-        repeat(scrollCount) {
-            suspendCancellableCoroutine<Unit> { continuation ->
-                // CRITICAL FIX 3: Removed immediate script double-resuming crash pattern
-                webView.evaluateJavascript("window.scrollBy(0, window.innerHeight); true;", null)
-                
-                webView.postDelayed({
-                    if (continuation.isActive) {
-                        continuation.resume(Unit)
-                    }
-                }, 1500)
+    // ── Link extraction ───────────────────────────────────────────────────────
+
+    suspend fun extractAllLinks(selector: String = "a[href]"): List<String> =
+        suspendCancellableCoroutine { cont ->
+            mainHandler.post {
+                val wv = existingWebView ?: run { if (cont.isActive) cont.resume(emptyList()); return@post }
+                wv.evaluateJavascript("""
+                    (function(){
+                        return JSON.stringify(
+                            Array.from(document.querySelectorAll('$selector'))
+                                .map(a=>a.href)
+                                .filter(h=>h&&h.startsWith('http'))
+                        );
+                    })()
+                """.trimIndent()) { raw ->
+                    val json = raw?.unescapeJs() ?: "[]"
+                    val links = try {
+                        kotlinx.serialization.json.Json.decodeFromString<List<String>>(json)
+                    } catch (_: Exception) { emptyList() }
+                    if (cont.isActive) cont.resume(links)
+                }
             }
         }
-    }
 
-    private fun onJSContentReady(html: String) {
-        pageContent = html
-        if (!readySignal.isDone) {
-            readySignal.complete(html)
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    fun destroy() {
+        mainHandler.post {
+            existingWebView?.stopLoading()
+            existingWebView?.destroy()
         }
     }
 
     fun reset() {
-        pageContent = ""
-        readySignal = CompletableFuture<String>()
+        mainHandler.post { existingWebView?.clearHistory() }
     }
 
-    fun destroy() {
-        webView.stopLoading()
-        webView.destroy()
+    // ── Internal helpers ──────────────────────────────────────────────────────
+
+    private fun configureWebView(wv: WebView) {
+        wv.settings.apply {
+            javaScriptEnabled                = true
+            domStorageEnabled                = true
+            databaseEnabled                  = true
+            cacheMode                        = WebSettings.LOAD_NO_CACHE
+            mixedContentMode                 = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+            javaScriptCanOpenWindowsAutomatically = false
+            loadWithOverviewMode             = true
+            useWideViewPort                  = true
+            setSupportZoom(false)
+            // Snapdragon S24 / Android 14 Chrome UA — passes most bot checks
+            userAgentString = "Mozilla/5.0 (Linux; Android 14; SM-S928B) " +
+                "AppleWebKit/537.36 (KHTML, like Gecko) " +
+                "Chrome/124.0.0.0 Mobile Safari/537.36"
+        }
+        CookieManager.getInstance().apply {
+            setAcceptCookie(true)
+            setAcceptThirdPartyCookies(wv, true)
+        }
+        wv.clearCache(true)
+        wv.clearHistory()
     }
+
+    private fun captureHtml(view: WebView, callback: (String) -> Unit) {
+        view.evaluateJavascript(
+            "(function(){ return document.documentElement.outerHTML; })()"
+        ) { raw -> callback(raw?.unescapeJs() ?: "") }
+    }
+
+    private fun injectSearchAndCapture(
+        view: WebView,
+        query: String,
+        waitMs: Long,
+        callback: (String) -> Unit
+    ) {
+        val escaped = query.replace("'", "\\'")
+        val js = """
+            (function(){
+                var selectors = [
+                    'input[type="search"]','input[type="text"][name*="q"]',
+                    'input[name*="query"]','input[placeholder*="search" i]',
+                    'input[type="text"]'
+                ];
+                var inp = null;
+                for(var s of selectors){ inp = document.querySelector(s); if(inp) break; }
+                if(inp){
+                    inp.value='$escaped';
+                    inp.dispatchEvent(new Event('input',{bubbles:true}));
+                    inp.dispatchEvent(new Event('change',{bubbles:true}));
+                    var form = inp.closest('form');
+                    if(form){ form.submit(); return 'form'; }
+                    var btn = document.querySelector(
+                        'button[type="submit"],input[type="submit"],.search-btn,.btn-search,[class*="search"][class*="btn"]'
+                    );
+                    if(btn){ btn.click(); return 'btn'; }
+                }
+                return 'none';
+            })()
+        """.trimIndent()
+
+        view.evaluateJavascript(js) { result ->
+            val action = result?.trim('"') ?: "none"
+            val delay  = if (action == "none") 500L else waitMs
+            view.postDelayed({ captureHtml(view, callback) }, delay)
+        }
+    }
+
+    private fun String.unescapeJs(): String =
+        trim('"')
+            .replace("\\\"", "\"")
+            .replace("\\n", "\n")
+            .replace("\\t", "\t")
+            .replace("\\\\", "\\")
+            .replace("\\/", "/")
 }
