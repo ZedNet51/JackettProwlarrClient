@@ -37,12 +37,13 @@ class MemoryOptimizer @Inject constructor(
         val memInfo = ActivityManager.MemoryInfo()
         activityManager.getMemoryInfo(memInfo)
         
+        val totalMemory = memInfo.totalDeviceMemory
         return MemoryInfo(
-            totalMemory = memInfo.totalMemory,
+            totalMemory = totalMemory,
             availableMemory = memInfo.availMem,
             isLowMemory = memInfo.lowMemory,
-            percentUsed = if (memInfo.totalMemory > 0) 
-                ((memInfo.totalMemory - memInfo.availMem).toFloat() / memInfo.totalMemory * 100f) 
+            percentUsed = if (totalMemory > 0) 
+                ((totalMemory - memInfo.availMem).toFloat() / totalMemory * 100f) 
             else 0f
         )
     }
